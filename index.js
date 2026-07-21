@@ -297,26 +297,38 @@ async function submitBulkApiJob(auth, rows) {
 
 // ---------- Route ----------
 
+// Every response (success or error) below carries a `stage` field naming exactly where the request
+// got to: received -> auth_validated -> render_reached -> render_parsed -> accounts_loaded ->
+// dedup_checked -> bulk_job_submitted. The VF page logs/displays this directly, so "is it Render
+// connected, is it parsing, is it returning" is answered by the response itself, not by anyone needing
+// dashboard access to this service's own logs.
 app.post('/import', upload.single('file'), async (req, res) => {
     const bankId = req.body.bankId;
-    console.log(`[import] request received - bankId=${bankId}, fileName=${req.file && req.file.originalname}, size=${req.file && req.file.buffer.length} bytes`);
+    const t0 = Date.now();
+    const elapsed = () => `${Date.now() - t0}ms`;
+    console.log(`[import] stage=received bankId=${bankId} fileName=${req.file && req.file.originalname} size=${req.file && req.file.buffer.length}bytes`);
 
     try {
         if (!bankId || !SALESFORCE_ID_RE.test(bankId)) {
-            return res.status(400).json({ message: 'Missing or invalid Bank record Id.' });
+            console.error(`[import] stage=received FAILED - missing/invalid bankId=${bankId}`);
+            return res.status(400).json({ stage: 'received', message: 'Missing or invalid Bank record Id.' });
         }
         if (!req.file || !req.file.buffer || req.file.buffer.length === 0) {
-            return res.status(400).json({ message: 'Please choose a file to import.' });
+            console.error(`[import] stage=received FAILED - no file bytes for bankId=${bankId}`);
+            return res.status(400).json({ stage: 'received', message: 'Please choose a file to import.' });
         }
 
         let auth;
         try {
             auth = buildAuth(req.body.sessionId, req.body.instanceUrl);
+            console.log(`[import] stage=auth_validated bankId=${bankId} instanceUrl=${auth.instanceUrl} elapsed=${elapsed()}`);
         } catch (e) {
-            return res.status(400).json({ message: e.message });
+            console.error(`[import] stage=auth_validated FAILED bankId=${bankId}: ${e.message}`);
+            return res.status(400).json({ stage: 'auth_validated', message: e.message });
         }
 
         let parseRes;
+        console.log(`[import] stage=render_reached calling ${RENDER_PARSER_URL} for bankId=${bankId}...`);
         try {
             parseRes = await fetch(RENDER_PARSER_URL, {
                 method: 'POST',
@@ -324,37 +336,42 @@ app.post('/import', upload.single('file'), async (req, res) => {
                 body: req.file.buffer
             });
         } catch (e) {
-            console.error(`[import] Render callout failed for bankId=${bankId}:`, e);
-            return res.status(502).json({ message: `Could not reach the BAI2 parsing service. ${e.message}` });
+            console.error(`[import] stage=render_reached FAILED bankId=${bankId} elapsed=${elapsed()}:`, e);
+            return res.status(502).json({ stage: 'render_reached', message: `Could not reach the BAI2 parsing service (Render). ${e.message}` });
         }
+        console.log(`[import] stage=render_reached OK bankId=${bankId} httpStatus=${parseRes.status} elapsed=${elapsed()}`);
 
         const parseText = await parseRes.text();
         if (!parseRes.ok) {
-            console.error(`[import] Render returned HTTP ${parseRes.status} for bankId=${bankId}: ${parseText}`);
-            return res.status(502).json({ message: `BAI2 parser service returned HTTP ${parseRes.status}: ${parseText}` });
+            console.error(`[import] stage=render_parsed FAILED bankId=${bankId} httpStatus=${parseRes.status}: ${parseText}`);
+            return res.status(502).json({ stage: 'render_parsed', message: `BAI2 parser service returned HTTP ${parseRes.status}: ${parseText}` });
         }
 
         let parsedJson;
         try {
             parsedJson = JSON.parse(parseText);
         } catch (e) {
-            return res.status(502).json({ message: 'The parsing service response could not be read.' });
+            console.error(`[import] stage=render_parsed FAILED bankId=${bankId} - response was not valid JSON: ${parseText.slice(0, 500)}`);
+            return res.status(502).json({ stage: 'render_parsed', message: 'The parsing service response could not be read.' });
         }
-        console.log(`[import] Render parse OK for bankId=${bankId}`);
+        console.log(`[import] stage=render_parsed OK bankId=${bankId} groups=${(parsedJson.groups || []).length} elapsed=${elapsed()}`);
 
         const accountsByNumber = await loadAccountsForBank(auth, bankId);
-        console.log(`[import] matched ${Object.keys(accountsByNumber).length} Bank_Account__c record(s) for bankId=${bankId}`);
+        console.log(`[import] stage=accounts_loaded bankId=${bankId} matched=${Object.keys(accountsByNumber).length} Bank_Account__c record(s) elapsed=${elapsed()}`);
 
         const rows = buildTransactionRows(parsedJson, accountsByNumber);
+        console.log(`[import] stage=rows_built bankId=${bankId} rowCount=${rows.length} elapsed=${elapsed()}`);
         if (rows.length === 0) {
-            return res.json({ jobId: null, recordCount: 0, message: 'No importable transactions found in the parsed file.' });
+            return res.json({ stage: 'rows_built', jobId: null, recordCount: 0, message: 'No importable transactions found in the parsed file.' });
         }
 
         const existingIds = await findExistingTransactionIds(auth, rows.map((r) => r.transaction_id__c));
         const toInsert = dedupeRows(rows, existingIds);
+        console.log(`[import] stage=dedup_checked bankId=${bankId} newRows=${toInsert.length} alreadyImported=${rows.length - toInsert.length} elapsed=${elapsed()}`);
 
         if (toInsert.length === 0) {
             return res.json({
+                stage: 'dedup_checked',
                 jobId: null,
                 recordCount: 0,
                 message: `All ${rows.length} transaction(s) in this file were already imported previously.`
@@ -367,12 +384,12 @@ app.post('/import', upload.single('file'), async (req, res) => {
         if (skipped > 0) {
             message += ` ${skipped} already-imported/duplicate transaction(s) skipped.`;
         }
-        console.log(`[import] Bulk API job ${jobId} submitted for bankId=${bankId} - ${toInsert.length} row(s), ${skipped} skipped`);
+        console.log(`[import] stage=bulk_job_submitted OK bankId=${bankId} jobId=${jobId} rows=${toInsert.length} skipped=${skipped} totalElapsed=${elapsed()}`);
 
-        return res.json({ jobId, recordCount: toInsert.length, message });
+        return res.json({ stage: 'bulk_job_submitted', jobId, recordCount: toInsert.length, message });
     } catch (e) {
-        console.error(`[import] Unexpected error for bankId=${bankId}:`, e);
-        return res.status(500).json({ message: `Unexpected error while importing this file. ${e.message}` });
+        console.error(`[import] stage=unexpected_error bankId=${bankId} elapsed=${elapsed()}:`, e);
+        return res.status(500).json({ stage: 'unexpected_error', message: `Unexpected error while importing this file. ${e.message}` });
     }
 });
 
