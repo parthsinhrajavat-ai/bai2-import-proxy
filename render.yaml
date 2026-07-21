@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: bai2-import-proxy
+    runtime: node
+    rootDir: bai2-import-proxy
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: RENDER_PARSER_URL
+        value: https://bai2-parser.onrender.com/format
+      - key: SF_API_VERSION
+        value: v67.0
+      - key: ALLOWED_ORIGIN
+        value: "*"

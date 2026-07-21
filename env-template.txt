@@ -1,0 +1,23 @@
+# Copy this to a real .env file (not tracked by git) before running the proxy locally.
+# On Render, set these as Environment Variables in the service's dashboard instead of a file.
+
+# Render bai2-parser service (public, unmodifiable moov/bai2 image).
+RENDER_PARSER_URL=https://bai2-parser.onrender.com/format
+
+SF_API_VERSION=v67.0
+
+# Comma-separated list of origins allowed to call this proxy (your org's Visualforce/Lightning
+# domain(s), e.g. https://yourdomain.lightning.force.com,https://yourdomain--c.vf.force.com).
+# "*" is fine for local testing only - lock this down before going live.
+ALLOWED_ORIGIN=*
+
+PORT=3000
+
+# No Salesforce credentials needed here for now - TEMPORARY quick path: the browser sends this proxy
+# a live session Id + instance URL per request (see ImportBaiFile.page / BAIFileProcessor.getSessionContext()).
+# Not scalable/production-safe. To upgrade later to a Connected App (Client Credentials Flow) instead:
+#   1. Setup -> App Manager -> New Connected App -> Enable OAuth Settings ->
+#      check "Enable Client Credentials Flow" -> set a Run As user -> Save.
+#   2. Add SF_LOGIN_URL / SF_CLIENT_ID / SF_CLIENT_SECRET here.
+#   3. Swap buildAuth()/sfFetch() in index.js for a client_credentials token fetch against
+#      {SF_LOGIN_URL}/services/oauth2/token, cached until near expiry.
