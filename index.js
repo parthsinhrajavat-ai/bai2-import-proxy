@@ -330,10 +330,15 @@ app.post('/import', upload.single('file'), async (req, res) => {
         let parseRes;
         console.log(`[import] stage=render_reached calling ${RENDER_PARSER_URL} for bankId=${bankId}...`);
         try {
+            // moov-io/bai2 (the Render parser image) expects multipart/form-data with the file under
+            // the field name "input" - see https://github.com/moov-io/bai2 (`curl --form "input=@...`).
+            // Do NOT set a Content-Type header manually: fetch() derives the correct
+            // "multipart/form-data; boundary=..." value from the FormData body itself.
+            const parserForm = new FormData();
+            parserForm.append('input', new Blob([req.file.buffer]), req.file.originalname || 'upload.bai2');
             parseRes = await fetch(RENDER_PARSER_URL, {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/octet-stream' },
-                body: req.file.buffer
+                body: parserForm
             });
         } catch (e) {
             console.error(`[import] stage=render_reached FAILED bankId=${bankId} elapsed=${elapsed()}:`, e);
