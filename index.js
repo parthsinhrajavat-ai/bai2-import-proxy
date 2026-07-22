@@ -393,6 +393,44 @@ app.post('/import', upload.single('file'), async (req, res) => {
     }
 });
 
+// Polled from the VF page via plain fetch() once /import hands back a jobId - mirrors what
+// BAIFileProcessor.checkJobStatus used to do from Apex (a self-callout to Salesforce's own Bulk API
+// using the session Id as a bearer token), moved here so the browser never needs Visualforce JS
+// Remoting (window.Visualforce) to check job status.
+app.get('/status/:jobId', async (req, res) => {
+    const { jobId } = req.params;
+    const { sessionId, instanceUrl } = req.query;
+
+    if (!SALESFORCE_ID_RE.test(jobId)) {
+        return res.status(400).json({ message: 'Invalid Bulk API job Id.' });
+    }
+
+    let auth;
+    try {
+        auth = buildAuth(sessionId, instanceUrl);
+    } catch (e) {
+        return res.status(400).json({ message: e.message });
+    }
+
+    try {
+        const sfRes = await sfFetch(auth, `/services/data/${SF_API_VERSION}/jobs/ingest/${jobId}`);
+        const body = await sfRes.json();
+        if (!sfRes.ok) {
+            return res.status(502).json({ message: `Bulk API status check failed: ${JSON.stringify(body)}` });
+        }
+        res.json({
+            jobId,
+            state: body.state,
+            numberRecordsProcessed: body.numberRecordsProcessed || 0,
+            numberRecordsFailed: body.numberRecordsFailed || 0,
+            errorMessage: body.state === 'Failed' ? body.errorMessage : null
+        });
+    } catch (e) {
+        console.error(`[status] jobId=${jobId} FAILED:`, e);
+        res.status(500).json({ message: `Unexpected error checking job status. ${e.message}` });
+    }
+});
+
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 app.use((err, req, res, next) => {
