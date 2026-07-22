@@ -112,22 +112,22 @@ function parseIsoOrBaiDate(raw) {
 // Walks groups -> accounts -> details from the Render /format JSON and builds Transaction__c-shaped rows.
 function buildTransactionRows(parsedJson, accountsByNumber) {
     const rows = [];
-    const groups = parsedJson.groups || [];
+    const groups = parsedJson.Groups || [];
     let detailIndex = 0;
 
     for (const group of groups) {
-        const accounts = group.accounts || [];
+        const accounts = group.Accounts || [];
         for (const account of accounts) {
             const accountNumber = account.accountNumber;
             const matched = accountNumber ? accountsByNumber[accountNumber] : null;
             if (!matched) {
                 continue;
             }
-            const details = account.details || [];
+            const details = account.Details || []; // Details can be null
             for (const detail of details) {
                 detailIndex++;
-                const typeCode = detail.typeCode;
-                const amountRaw = detail.amount;
+                const typeCode = detail.TypeCode;
+                const amountRaw = detail.Amount;
                 if (!typeCode || amountRaw === undefined || amountRaw === null) {
                     continue;
                 }
@@ -139,9 +139,9 @@ function buildTransactionRows(parsedJson, accountsByNumber) {
                     continue;
                 }
 
-                const customerRef = pickString(detail, ['customerRef', 'reference', 'bankRef', 'id']);
-                const text = pickString(detail, ['text', 'description', 'memo']);
-                const dateRaw = pickString(detail, ['date', 'valueDate', 'transactionDate']);
+                const customerRef = pickString(detail, ['CustomerReferenceNumber', 'BankReferenceNumber']);
+                const text = pickString(detail, ['Text']);
+                const dateRaw = detail.FundsType ? detail.FundsType.date : null;
 
                 const row = {
                     Bank_Account__c: matched.Id,
@@ -359,7 +359,8 @@ app.post('/import', upload.single('file'), async (req, res) => {
             console.error(`[import] stage=render_parsed FAILED bankId=${bankId} - response was not valid JSON: ${parseText.slice(0, 500)}`);
             return res.status(502).json({ stage: 'render_parsed', message: 'The parsing service response could not be read.' });
         }
-        console.log(`[import] stage=render_parsed OK bankId=${bankId} groups=${(parsedJson.groups || []).length} elapsed=${elapsed()}`);
+        // console.log(`[import] stage=render_parsed OK bankId=${bankId} groups=${(parsedJson.groups || []).length} elapsed=${elapsed()}`);
+        console.log(`[import] stage=render_parsed OK bankId=${bankId} groups=${(parsedJson.Groups || []).length} elapsed=${elapsed()}`);
 
         const accountsByNumber = await loadAccountsForBank(auth, bankId);
         console.log(`[import] stage=accounts_loaded bankId=${bankId} matched=${Object.keys(accountsByNumber).length} Bank_Account__c record(s) elapsed=${elapsed()}`);
