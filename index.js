@@ -4,6 +4,12 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const { Agent } = require('undici');
+
+// Large multipart bodies over HTTP/2 can hit a Node/undici bug (TypeError: terminated,
+// caused by ERR_HTTP2_STREAM_ERROR / NGHTTP2_INTERNAL_ERROR). Forcing HTTP/1.1 for just the
+// parser upload avoids it without disabling HTTP/2 for anything else this process does.
+const noH2Agent = new Agent({ allowH2: false });
 
 const {
     RENDER_PARSER_URL = 'https://bai2-parser.onrender.com/format',
@@ -332,7 +338,8 @@ app.post('/import', upload.single('file'), async (req, res) => {
             parserForm.append('input', new Blob([req.file.buffer]), req.file.originalname || 'upload.bai2');
             parseRes = await fetch(RENDER_PARSER_URL, {
                 method: 'POST',
-                body: parserForm
+                body: parserForm,
+                dispatcher: noH2Agent
             });
         } catch (e) {
             console.error(`[import] stage=render_reached FAILED bankId=${bankId} elapsed=${elapsed()}:`, e);
