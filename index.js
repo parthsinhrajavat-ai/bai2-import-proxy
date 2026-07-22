@@ -423,7 +423,79 @@ app.post('/import', upload.single('file'), async (req, res) => {
     }
 });
 
-// Polled from the VF page via plain fetch() once /import hands back a jobId - mirrors what 
+// Minimal RFC4180-ish CSV parser (handles quoted fields containing commas/quotes/newlines) -
+// needed to read the failedResults CSV below since Salesforce error messages routinely contain commas.
+function parseCsv(text) {
+    const rows = [];
+    let row = [];
+    let field = '';
+    let inQuotes = false;
+    for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (inQuotes) {
+            if (c === '"') {
+                if (text[i + 1] === '"') {
+                    field += '"';
+                    i++;
+                } else {
+                    inQuotes = false;
+                }
+            } else {
+                field += c;
+            }
+        } else if (c === '"') {
+            inQuotes = true;
+        } else if (c === ',') {
+            row.push(field);
+            field = '';
+        } else if (c === '\n' || c === '\r') {
+            if (c === '\r' && text[i + 1] === '\n') i++;
+            row.push(field);
+            rows.push(row);
+            row = [];
+            field = '';
+        } else {
+            field += c;
+        }
+    }
+    if (field !== '' || row.length > 0) {
+        row.push(field);
+        rows.push(row);
+    }
+    return rows.filter((r) => !(r.length === 1 && r[0] === ''));
+}
+
+// Fetches the Bulk API 2.0 failedResults CSV and pulls out up to 5 deduplicated sf__Error values,
+// so the VF page can show the real Salesforce rejection reason instead of just a failed count.
+async function fetchSampleErrors(auth, jobId) {
+    try {
+        const res = await sfFetch(auth, `/services/data/${SF_API_VERSION}/jobs/ingest/${jobId}/failedResults`);
+        if (!res.ok) {
+            console.error(`[status] jobId=${jobId} failedResults fetch failed: HTTP ${res.status}`);
+            return [];
+        }
+        const rows = parseCsv(await res.text());
+        if (rows.length < 2) return [];
+        const errIndex = rows[0].indexOf('sf__Error');
+        if (errIndex === -1) return [];
+
+        const seen = new Set();
+        const sampleErrors = [];
+        for (let i = 1; i < rows.length && sampleErrors.length < 5; i++) {
+            const val = rows[i][errIndex];
+            if (val && !seen.has(val)) {
+                seen.add(val);
+                sampleErrors.push(val);
+            }
+        }
+        return sampleErrors;
+    } catch (e) {
+        console.error(`[status] jobId=${jobId} failedResults fetch threw:`, e);
+        return [];
+    }
+}
+
+// Polled from the VF page via plain fetch() once /import hands back a jobId - mirrors what
 app.get('/status/:jobId', async (req, res) => {
     const { jobId } = req.params;
     const { sessionId, instanceUrl } = req.query;
@@ -445,12 +517,16 @@ app.get('/status/:jobId', async (req, res) => {
         if (!sfRes.ok) {
             return res.status(502).json({ message: `Bulk API status check failed: ${JSON.stringify(body)}` });
         }
+        const numberRecordsFailed = body.numberRecordsFailed || 0;
+        const sampleErrors = numberRecordsFailed > 0 ? await fetchSampleErrors(auth, jobId) : [];
+
         res.json({
             jobId,
             state: body.state,
             numberRecordsProcessed: body.numberRecordsProcessed || 0,
-            numberRecordsFailed: body.numberRecordsFailed || 0,
-            errorMessage: body.state === 'Failed' ? body.errorMessage : null
+            numberRecordsFailed,
+            errorMessage: body.state === 'Failed' ? body.errorMessage : null,
+            sampleErrors
         });
     } catch (e) {
         console.error(`[status] jobId=${jobId} FAILED:`, e);
