@@ -4,12 +4,13 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { Agent } = require('undici');
-
-// Large multipart bodies over HTTP/2 can hit a Node/undici bug (TypeError: terminated,
-// caused by ERR_HTTP2_STREAM_ERROR / NGHTTP2_INTERNAL_ERROR). Forcing HTTP/1.1 for just the
-// parser upload avoids it without disabling HTTP/2 for anything else this process does.
-const noH2Agent = new Agent({ allowH2: false });
+// Named nodeFetch/NodeFormData (not fetch/FormData) so these don't shadow the built-in global
+// fetch/FormData used elsewhere in this file (e.g. sfFetch's calls to Salesforce). node-fetch@2
+// and form-data both use Node's classic http/https modules - always HTTP/1.1, no HTTP/2
+// negotiation - which sidesteps a Node/undici HTTP2 bug (TypeError: terminated /
+// ERR_HTTP2_STREAM_ERROR / NGHTTP2_INTERNAL_ERROR) seen on large multipart uploads to the parser.
+const nodeFetch = require('node-fetch');
+const NodeFormData = require('form-data');
 
 const {
     RENDER_PARSER_URL = 'https://bai2-parser.onrender.com/format',
@@ -298,6 +299,38 @@ async function submitBulkApiJob(auth, rows) {
     return jobId;
 }
 
+// ---------- Parser call (node-fetch@2 + form-data, with retry) ----------
+
+const PARSER_MAX_RETRIES = 2;
+const PARSER_RETRY_DELAY_MS = 1000;
+
+// moov-io/bai2 (the Render parser image) expects multipart/form-data with the file under the
+// field name "input" - see https://github.com/moov-io/bai2 (`curl --form "input=@...`).
+// Only retries network-level failures (the request itself throwing - reset, timeout,
+// "terminated", etc.). An HTTP error response (e.g. 400/500) resolves normally instead of
+// throwing and is handled separately by the caller, since retrying a real "no" wouldn't help.
+async function callParserWithRetry(fileBuffer, fileName) {
+    let lastErr;
+    for (let attempt = 1; attempt <= PARSER_MAX_RETRIES + 1; attempt++) {
+        const parserForm = new NodeFormData();
+        parserForm.append('input', fileBuffer, { filename: fileName || 'upload.bai2' });
+        try {
+            return await nodeFetch(RENDER_PARSER_URL, {
+                method: 'POST',
+                body: parserForm,
+                headers: parserForm.getHeaders()
+            });
+        } catch (e) {
+            lastErr = e;
+            if (attempt <= PARSER_MAX_RETRIES) {
+                console.error(`[import] stage=render_reached network error on attempt ${attempt}/${PARSER_MAX_RETRIES + 1}, retrying in ${PARSER_RETRY_DELAY_MS}ms: ${e.message}`);
+                await new Promise((resolve) => setTimeout(resolve, PARSER_RETRY_DELAY_MS));
+            }
+        }
+    }
+    throw lastErr;
+}
+
 // ---------- Route ----------
 
 // Every response (success or error) below carries a `stage` field naming exactly where the request 
@@ -330,17 +363,7 @@ app.post('/import', upload.single('file'), async (req, res) => {
         let parseRes;
         console.log(`[import] stage=render_reached calling ${RENDER_PARSER_URL} for bankId=${bankId}...`);
         try {
-            // moov-io/bai2 (the Render parser image) expects multipart/form-data with the file under
-            // the field name "input" - see https://github.com/moov-io/bai2 (`curl --form "input=@...`).
-            // Do NOT set a Content-Type header manually: fetch() derives the correct
-            // "multipart/form-data; boundary=..." value from the FormData body itself.
-            const parserForm = new FormData();
-            parserForm.append('input', new Blob([req.file.buffer]), req.file.originalname || 'upload.bai2');
-            parseRes = await fetch(RENDER_PARSER_URL, {
-                method: 'POST',
-                body: parserForm,
-                dispatcher: noH2Agent
-            });
+            parseRes = await callParserWithRetry(req.file.buffer, req.file.originalname);
         } catch (e) {
             console.error(`[import] stage=render_reached FAILED bankId=${bankId} elapsed=${elapsed()}:`, e);
             return res.status(502).json({ stage: 'render_reached', message: `Could not reach the BAI2 parsing service (Render). ${e.message}` });
