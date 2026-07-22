@@ -26,13 +26,6 @@ app.use(
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_FILE_BYTES } });
 
-// ---------- Salesforce auth: TEMPORARY quick path ----------
-// The browser hands us the running user's own session Id + instance URL per-request (fetched fresh
-// from Apex's UserInfo.getSessionId() for every import - see BAIFileProcessor.getSessionContext()).
-// This avoids standing up a Connected App, but is NOT scalable/production-safe: a live session token
-// is now travelling through the browser to a third-party service, and can be rejected outright
-// depending on the org's Session Settings. Swap for the proxy's own Connected App (Client Credentials
-// Flow) once this is confirmed working end-to-end - see README notes below for what that involves.
 
 // Only ever call out to a real Salesforce domain with the caller-supplied instanceUrl - without this,
 // a caller could pass an arbitrary host and trick the proxy into sending its bearer token elsewhere (SSRF).
@@ -55,7 +48,7 @@ async function sfFetch(auth, path, options = {}) {
     });
 }
 
-// ---------- Field-mapping logic ported from BAIFileProcessor.cls ----------
+//  Field-mapping logic ported from BAIFileProcessor.cls  
 
 function typeCodeFamilyDigit(typeCode) {
     if (!typeCode || !/^[0-9]/.test(typeCode)) return null;
@@ -131,7 +124,9 @@ function buildTransactionRows(parsedJson, accountsByNumber) {
                 if (!typeCode || amountRaw === undefined || amountRaw === null) {
                     continue;
                 }
-                const amount = Number(amountRaw);
+                // BAI2 amounts are whole cents with no decimal point (e.g. 1221009 = $12,210.09).
+                // Math.round before dividing avoids floating point artifacts like 12210.089999999998.
+                const amount = Math.round(Number(amountRaw)) / 100;
                 if (Number.isNaN(amount)) {
                     continue;
                 }
@@ -141,6 +136,8 @@ function buildTransactionRows(parsedJson, accountsByNumber) {
 
                 const customerRef = pickString(detail, ['CustomerReferenceNumber', 'BankReferenceNumber']);
                 const text = pickString(detail, ['Text']);
+                // Strip the BAI2 line terminator "/" that otherwise leaks onto the end of merchant_name__c.
+                const cleanText = text ? text.replace(/\/\s*$/, '').trim() : text;
                 const dateRaw = detail.FundsType ? detail.FundsType.date : null;
 
                 const row = {
@@ -154,12 +151,12 @@ function buildTransactionRows(parsedJson, accountsByNumber) {
                     Debit_Amount__c: ''
                 };
 
-                if (text && text.includes('|')) {
-                    const pipeIndex = text.indexOf('|');
-                    row.Category__c = text.substring(0, pipeIndex).trim();
-                    row.merchant_name__c = text.substring(pipeIndex + 1).trim();
-                } else if (text) {
-                    row.merchant_name__c = text;
+                if (cleanText && cleanText.includes('|')) {
+                    const pipeIndex = cleanText.indexOf('|');
+                    row.Category__c = cleanText.substring(0, pipeIndex).trim();
+                    row.merchant_name__c = cleanText.substring(pipeIndex + 1).trim();
+                } else if (cleanText) {
+                    row.merchant_name__c = cleanText;
                 }
 
                 if (isCreditTypeCode(typeCode)) {
@@ -297,10 +294,7 @@ async function submitBulkApiJob(auth, rows) {
 
 // ---------- Route ----------
 
-// Every response (success or error) below carries a `stage` field naming exactly where the request
-// got to: received -> auth_validated -> render_reached -> render_parsed -> accounts_loaded ->
-// dedup_checked -> bulk_job_submitted. The VF page logs/displays this directly, so "is it Render
-// connected, is it parsing, is it returning" is answered by the response itself, not by anyone needing
+// Every response (success or error) below carries a `stage` field naming exactly where the request 
 // dashboard access to this service's own logs.
 app.post('/import', upload.single('file'), async (req, res) => {
     const bankId = req.body.bankId;
@@ -399,10 +393,7 @@ app.post('/import', upload.single('file'), async (req, res) => {
     }
 });
 
-// Polled from the VF page via plain fetch() once /import hands back a jobId - mirrors what
-// BAIFileProcessor.checkJobStatus used to do from Apex (a self-callout to Salesforce's own Bulk API
-// using the session Id as a bearer token), moved here so the browser never needs Visualforce JS
-// Remoting (window.Visualforce) to check job status.
+// Polled from the VF page via plain fetch() once /import hands back a jobId - mirrors what 
 app.get('/status/:jobId', async (req, res) => {
     const { jobId } = req.params;
     const { sessionId, instanceUrl } = req.query;
