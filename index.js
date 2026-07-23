@@ -110,7 +110,7 @@ function parseIsoOrBaiDate(raw) {
 }
 
 // Walks groups -> accounts -> details from the Render /format JSON and builds Transaction__c-shaped rows.
-function buildTransactionRows(parsedJson, accountsByNumber) {
+function buildTransactionRows(parsedJson, accountsByNumber, typeCodeLabels) {
     const rows = [];
     const groups = parsedJson.Groups || [];
     let detailIndex = 0;
@@ -163,7 +163,9 @@ function buildTransactionRows(parsedJson, accountsByNumber) {
                     row.Category__c = cleanText.substring(0, pipeIndex).trim();
                     row.merchant_name__c = cleanText.substring(pipeIndex + 1).trim();
                 } else if (cleanText) {
-                    row.merchant_name__c = cleanText;
+                    // row.merchant_name__c = cleanText;
+                       row.Category__c = (typeCodeLabels && typeCodeLabels[typeCode]) || '';
+                       row.merchant_name__c = cleanText || '';
                 }
 
                 if (isCreditTypeCode(typeCode)) {
@@ -241,6 +243,25 @@ async function loadAccountsForBank(auth, bankId) {
         if (rec.Name) map[rec.Name] = rec;
     }
     return map;
+}
+
+
+// Loads the BAI2 type-code  -label mapping from a Salesforce Static Resource
+async function loadTypeCodeLabels(auth) {
+    const soql = `SELECT Id FROM StaticResource WHERE Name = 'BAI2_Type_Codes'`;
+    const res = await sfFetch(auth, `/services/data/${SF_API_VERSION}/query?q=${encodeURIComponent(soql)}`);
+    const body = await res.json();
+    if (!res.ok || !body.records || !body.records[0]) {
+        console.error(`[import] stage=labels_loaded FAILED: static resource not found or query error`);
+        return {};
+    }
+    const resId = body.records[0].Id;
+    const bodyRes = await sfFetch(auth, `/services/data/${SF_API_VERSION}/sobjects/StaticResource/${resId}/Body`);
+    if (!bodyRes.ok) {
+        console.error(`[import] stage=labels_loaded FAILED: could not fetch static resource body`);
+        return {};
+    }
+    return await bodyRes.json();
 }
 
 // Batches the "already imported" check so the IN clause never gets too large for one query.
@@ -323,7 +344,7 @@ async function callParserWithRetry(fileBuffer, fileName) {
         } catch (e) {
             lastErr = e;
             if (attempt <= PARSER_MAX_RETRIES) {
-                console.error(`[import] stage=render_reached network error on attempt ${attempt}/${PARSER_MAX_RETRIES + 1}, retrying in ${PARSER_RETRY_DELAY_MS}ms: ${e.message}`);
+                console.error(`[import] stage=render_reached network error on attempt ${attempt}/${PARSER_MAX_RETRIES + 1}, retrying in ${PARSER_RETRY_DELAY_MS}ms: ${e.message}\nstack=${e.stack}`);
                 await new Promise((resolve) => setTimeout(resolve, PARSER_RETRY_DELAY_MS));
             }
         }
@@ -356,7 +377,7 @@ app.post('/import', upload.single('file'), async (req, res) => {
             auth = buildAuth(req.body.sessionId, req.body.instanceUrl);
             console.log(`[import] stage=auth_validated bankId=${bankId} instanceUrl=${auth.instanceUrl} elapsed=${elapsed()}`);
         } catch (e) {
-            console.error(`[import] stage=auth_validated FAILED bankId=${bankId}: ${e.message}`);
+            console.error(`[import] stage=auth_validated FAILED bankId=${bankId}: ${e.message}\nstack=${e.stack}`);
             return res.status(400).json({ stage: 'auth_validated', message: e.message });
         }
 
@@ -380,7 +401,7 @@ app.post('/import', upload.single('file'), async (req, res) => {
         try {
             parsedJson = JSON.parse(parseText);
         } catch (e) {
-            console.error(`[import] stage=render_parsed FAILED bankId=${bankId} - response was not valid JSON: ${parseText.slice(0, 500)}`);
+            console.error(`[import] stage=render_parsed FAILED bankId=${bankId} - response was not valid JSON: ${parseText.slice(0, 500)}\nmessage=${e.message}\nstack=${e.stack}`);
             return res.status(502).json({ stage: 'render_parsed', message: 'The parsing service response could not be read.' });
         }
         // console.log(`[import] stage=render_parsed OK bankId=${bankId} groups=${(parsedJson.groups || []).length} elapsed=${elapsed()}`);
@@ -389,7 +410,10 @@ app.post('/import', upload.single('file'), async (req, res) => {
         const accountsByNumber = await loadAccountsForBank(auth, bankId);
         console.log(`[import] stage=accounts_loaded bankId=${bankId} matched=${Object.keys(accountsByNumber).length} Bank_Account__c record(s) elapsed=${elapsed()}`);
 
-        const rows = buildTransactionRows(parsedJson, accountsByNumber);
+        const typeCodeLabels = await loadTypeCodeLabels(auth);
+        console.log(`[import] stage=labels_loaded bankId=${bankId} labelCount=${Object.keys(typeCodeLabels).length} elapsed=${elapsed()}`);
+
+        const rows = buildTransactionRows(parsedJson, accountsByNumber, typeCodeLabels);
         console.log(`[import] stage=rows_built bankId=${bankId} rowCount=${rows.length} elapsed=${elapsed()}`);
         if (rows.length === 0) {
             return res.json({ stage: 'rows_built', jobId: null, recordCount: 0, message: 'No importable transactions found in the parsed file.' });
