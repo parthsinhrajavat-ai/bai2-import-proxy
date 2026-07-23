@@ -322,25 +322,44 @@ async function submitBulkApiJob(auth, rows) {
 
 // ---------- Parser call (node-fetch@2 + form-data, with retry) ----------
 
-const PARSER_MAX_RETRIES = 2;
-const PARSER_RETRY_DELAY_MS = 1000;
+const PARSER_MAX_RETRIES = 6;
+const PARSER_RETRY_DELAY_MS = 10000;
+
+// Render's free tier spins the parser instance down when idle, so the first request after a
+// while wakes it up and gets a 502/503/504 until it's fully up - these are retried the same as
+// a network error. 6 retries * 10s covers ~60s, which is enough for a cold start to finish.
+const RETRYABLE_HTTP_STATUSES = [502, 503, 504];
 
 // moov-io/bai2 (the Render parser image) expects multipart/form-data with the file under the
 // field name "input" - see https://github.com/moov-io/bai2 (`curl --form "input=@...`).
-// Only retries network-level failures (the request itself throwing - reset, timeout,
-// "terminated", etc.). An HTTP error response (e.g. 400/500) resolves normally instead of
-// throwing and is handled separately by the caller, since retrying a real "no" wouldn't help.
+// Retries network-level failures (the request itself throwing - reset, timeout, "terminated",
+// etc.) and 502/503/504 HTTP responses (Render cold start). Any other HTTP error response (e.g.
+// 400/500) resolves normally instead of retrying and is handled separately by the caller, since
+// retrying a real "no" wouldn't help.
 async function callParserWithRetry(fileBuffer, fileName) {
     let lastErr;
+    let lastRes;
     for (let attempt = 1; attempt <= PARSER_MAX_RETRIES + 1; attempt++) {
         const parserForm = new NodeFormData();
         parserForm.append('input', fileBuffer, { filename: fileName || 'upload.bai2' });
         try {
-            return await nodeFetch(RENDER_PARSER_URL, {
+            const res = await nodeFetch(RENDER_PARSER_URL, {
                 method: 'POST',
                 body: parserForm,
                 headers: parserForm.getHeaders()
             });
+
+            if (RETRYABLE_HTTP_STATUSES.includes(res.status)) {
+                lastRes = res;
+                if (attempt <= PARSER_MAX_RETRIES) {
+                    console.error(`[import] stage=render_reached got HTTP ${res.status} on attempt ${attempt}/${PARSER_MAX_RETRIES + 1} (likely Render cold start), retrying in ${PARSER_RETRY_DELAY_MS}ms...`);
+                    await new Promise((resolve) => setTimeout(resolve, PARSER_RETRY_DELAY_MS));
+                    continue;
+                }
+                console.error(`[import] stage=render_reached still HTTP ${res.status} after ${PARSER_MAX_RETRIES + 1} attempts, giving up.`);
+            }
+
+            return res;
         } catch (e) {
             lastErr = e;
             if (attempt <= PARSER_MAX_RETRIES) {
@@ -348,6 +367,9 @@ async function callParserWithRetry(fileBuffer, fileName) {
                 await new Promise((resolve) => setTimeout(resolve, PARSER_RETRY_DELAY_MS));
             }
         }
+    }
+    if (lastRes) {
+        return lastRes;
     }
     throw lastErr;
 }
